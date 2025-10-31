@@ -88,50 +88,70 @@ binit(void)
 static struct buf*
 bget(uint dev, uint blockno)
 {
-  struct buf *b;
-	uint bi, hi = HASH(dev, blockno);
+  struct buf *hb, *mb; // hit buf, miss buf
+	uint bi, hi = HASH(dev, blockno); // bucket idx, hash idx
+	char org_miss = 0; // whether current logic is running under miss logic.
 
-	// prevent structure revising during traversal.
   acquire(&bcache.lock[hi]);
-	for (b = bcache.head[hi].next; b != &bcache.head[hi]; b = b->next) {
-		if (b->dev == dev && b->blockno == blockno) {
-			b->refcnt++;
+	hit_chk:
+	for (hb = bcache.head[hi].next; hb != &bcache.head[hi]; hb = hb->next) {
+		if (hb->dev == dev && hb->blockno == blockno) {
+			hb->refcnt++;
 			release(&bcache.lock[hi]);
-			acquiresleep(&b->lock); // cache hit
-			return b;	
+
+			if (org_miss) {
+				// rollback (connect buffer originally)
+				// bi and mb already exist.
+				acquire(&bcache.lock[bi]);
+			
+    		bcache.head[bi].next->prev = mb;
+		    bcache.head[bi].next = mb;
+
+				release(&bcache.lock[bi]);
+			}
+
+			acquiresleep(&hb->lock); // cache hit
+			return hb;	
 		}
 	}
+	if (org_miss)
+		goto miss_ok;
 	release(&bcache.lock[hi]);
 	
 	// cache miss
 	for (bi = 0; bi < BKSIZE; bi++) {
 		// another cache hit case allow a race b/w a miss's bi and many hi's.
 		// but there is nothing to do since cache hit is more important to access rapidly to data.
-		acquire(&bcache.lock[bi]); // prevent structure revising during traversal.
+		acquire(&bcache.lock[bi]);
 		// after bi lock, cache hit feels a race but it will be ok soon.
-		for (b = bcache.head[bi].next; b != &bcache.head[bi]; b = b->next) {
-			if (!b->refcnt) {
+		for (mb = bcache.head[bi].next; mb != &bcache.head[bi]; mb = mb->next) {
+			if (!mb->refcnt) {
 				// cut buffer
-				b->next->prev = b->prev;
-				b->prev->next = b->next;
+				mb->next->prev = mb->prev;
+				mb->prev->next = mb->next;
 
-				// assign field		
-				b->dev = dev;
-				b->blockno = blockno;
-				b->valid = 0;
-				b->refcnt = 1;
+				mb->refcnt = 1;
 				release(&bcache.lock[bi]);
 				// there is no nested locks so that deadlocks cannot occur instead some races.	
 				acquire(&bcache.lock[hi]);
+				org_miss = 1;
+				goto hit_chk; // re-check if the block is hit.
+				miss_ok:
+
+				// assign fields
+				mb->dev = dev;
+				mb->blockno = blockno;
+				mb->valid = 0;
+
 				// connect buffer				
-				b->next = bcache.head[hi].next;
-				b->prev = &bcache.head[hi];
-				bcache.head[hi].next->prev = b;
-				bcache.head[hi].next = b;
+				mb->next = bcache.head[hi].next;
+				mb->prev = &bcache.head[hi];
+				bcache.head[hi].next->prev = mb;
+				bcache.head[hi].next = mb;
 				release(&bcache.lock[hi]);
-	
-				acquiresleep(&b->lock);
-				return b;
+				
+				acquiresleep(&mb->lock);
+				return mb;
 			}
 		}
 		release(&bcache.lock[bi]);
@@ -177,7 +197,6 @@ brelse(struct buf *b)
 	acquire(&bcache.lock[hi]);
   b->refcnt--;
   if (b->refcnt == 0) {
-    // no one is waiting for it.
     b->next->prev = b->prev;
     b->prev->next = b->next;
     b->next = bcache.head[hi].next;
