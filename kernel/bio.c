@@ -23,11 +23,11 @@
 #include "fs.h"
 #include "buf.h"
 #define BKSIZE 17
+#define HASH(d, b) (((d) * (b)) % BKSIZE)
 
 struct {
   struct spinlock lock[BKSIZE];
   struct buf buf[NBUF];
-	struct spinlock gllk;
   // Linked list of all buffers, through prev/next.
   // Sorted by how recently the buffer was used.
   // head.next is most recent, head.prev is least.
@@ -44,11 +44,10 @@ binit(void)
   struct buf *b;
 	int i;
 
-	initlock(&bcache.gllk, "global_bcache");
 	for (i = 0; i < BKSIZE; i++) {
-		bcache.hlk_name[i][0] = 'b'; bcache.hlk_name[i][1] = 'u';
-		bcache.hlk_name[i][2] = 'c'; bcache.hlk_name[i][3] = 'k';
-		bcache.hlk_name[i][4] = 'e'; bcache.hlk_name[i][5] = 't';
+		bcache.hlk_name[i][0] = 'b'; bcache.hlk_name[i][1] = 'c';
+		bcache.hlk_name[i][2] = 'a'; bcache.hlk_name[i][3] = 'c';
+		bcache.hlk_name[i][4] = 'h'; bcache.hlk_name[i][5] = 'e';
 		bcache.hlk_name[i][6] = '0' + (i / 10);
 		bcache.hlk_name[i][7] = '0' + (i % 10);
 		bcache.hlk_name[i][8] = 0;
@@ -90,58 +89,53 @@ static struct buf*
 bget(uint dev, uint blockno)
 {
   struct buf *b;
-	uint bi, hi = (dev * blockno) % BKSIZE;
-	uint sm, bg;
+	uint bi, hi = HASH(dev, blockno);
 
+	// prevent structure revising during traversal.
   acquire(&bcache.lock[hi]);
 	for (b = bcache.head[hi].next; b != &bcache.head[hi]; b = b->next) {
 		if (b->dev == dev && b->blockno == blockno) {
 			b->refcnt++;
 			release(&bcache.lock[hi]);
-			acquiresleep(&b->lock);
+			acquiresleep(&b->lock); // cache hit
 			return b;	
 		}
 	}
 	release(&bcache.lock[hi]);
 	
-	acquire(&bcache.gllk);
+	// cache miss
 	for (bi = 0; bi < BKSIZE; bi++) {
-		acquire(&bcache.lock[bi]);
+		// another cache hit case allow a race b/w a miss's bi and many hi's.
+		// but there is nothing to do since cache hit is more important to access rapidly to data.
+		acquire(&bcache.lock[bi]); // prevent structure revising during traversal.
+		// after bi lock, cache hit feels a race but it will be ok soon.
 		for (b = bcache.head[bi].next; b != &bcache.head[bi]; b = b->next) {
 			if (!b->refcnt) {
+				// cut buffer
 				b->next->prev = b->prev;
-				b->prev->next = b->next;		
-				release(&bcache.lock[bi]);
-				
-				sm = (bi < hi) ? bi : hi;
-				bg = bi + hi - sm;
+				b->prev->next = b->next;
 
-				acquire(&bcache.lock[sm]);
-				if (sm != bg)
-					acquire(&bcache.lock[bg]);
-
+				// assign field		
 				b->dev = dev;
 				b->blockno = blockno;
 				b->valid = 0;
 				b->refcnt = 1;
-				
+				release(&bcache.lock[bi]);
+				// there is no nested locks so that deadlocks cannot occur instead some races.	
+				acquire(&bcache.lock[hi]);
+				// connect buffer				
 				b->next = bcache.head[hi].next;
 				b->prev = &bcache.head[hi];
 				bcache.head[hi].next->prev = b;
 				bcache.head[hi].next = b;
-
-				if (sm != bg)			
-					release(&bcache.lock[bg]);
-				release(&bcache.lock[sm]);			
+				release(&bcache.lock[hi]);
 	
-				release(&bcache.gllk);
 				acquiresleep(&b->lock);
 				return b;
 			}
 		}
 		release(&bcache.lock[bi]);
 	}
-	release(&bcache.gllk);
   panic("bget: no buffers");
 }
 
@@ -176,22 +170,39 @@ brelse(struct buf *b)
   if(!holdingsleep(&b->lock))
     panic("brelse");
 
-	b->refcnt--;
-	
-	if (!b->refcnt)
-		wakeup(b);	
+	uint hi = HASH(b->dev, b->blockno);
 
   releasesleep(&b->lock);
+
+	acquire(&bcache.lock[hi]);
+  b->refcnt--;
+  if (b->refcnt == 0) {
+    // no one is waiting for it.
+    b->next->prev = b->prev;
+    b->prev->next = b->next;
+    b->next = bcache.head[hi].next;
+    b->prev = &bcache.head[hi];
+    bcache.head[hi].next->prev = b;
+    bcache.head[hi].next = b;
+  }
+  
+  release(&bcache.lock[hi]);
 }
 
 void
 bpin(struct buf *b) {
+	uint hi = HASH(b->dev, b->blockno);
+	acquire(&bcache.lock[hi]);
   b->refcnt++;
+  release(&bcache.lock[hi]);
 }
 
 void
 bunpin(struct buf *b) {
+	uint hi = HASH(b->dev, b->blockno);
+	acquire(&bcache.lock[hi]);
   b->refcnt--;
+  release(&bcache.lock[hi]);
 }
 
 
