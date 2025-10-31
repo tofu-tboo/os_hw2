@@ -25,3 +25,8 @@ barrier
 .DS_Store
 *.dSYM
 *.pcap
+
+*.swp
+*.swo
+*.swm
+*.swn
