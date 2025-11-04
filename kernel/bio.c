@@ -25,6 +25,7 @@
 #define BKSIZE 17
 #define HASH(d, b) (((d) * (b)) % BKSIZE)
 
+
 struct {
   struct spinlock lock[BKSIZE];
   struct buf buf[NBUF];
